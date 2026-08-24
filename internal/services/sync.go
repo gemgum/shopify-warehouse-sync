@@ -53,47 +53,40 @@ func NewSyncService(db runner, shops models.ShopRepository, runs models.SyncRepo
 	}
 }
 
-// Diff reconciles store stock against warehouse stock.
+// Decide works out what one variant needs, if anything.
 //
 // This is the whole of this service's business rules, and deliberately a pure
 // function: it touches no database and no network, so it can be tested without
-// either.
+// either. It also takes one variant rather than a catalogue, which is what lets
+// the sync judge a store of any size without holding it in memory.
 //
-// A SKU the warehouse does not mention is **skipped, not zeroed**. A feed that
-// does not name a SKU means "unknown", and translating not-knowing into zero
-// would empty every product that happens not to be registered in the warehouse
-// yet — precisely the most expensive mistake a system like this can make.
-func Diff(store []models.InventoryItem, warehouse map[string]int) []models.Update {
-	var updates []models.Update
-
-	for _, item := range store {
-		// A variant with no SKU cannot be matched against anything. One with no
-		// id or location cannot be written back.
-		if item.SKU == "" || item.InventoryItemID == "" || item.LocationID == "" {
-			continue
-		}
-
-		wanted, known := warehouse[item.SKU]
-		if !known {
-			continue
-		}
-		// Negative stock means nothing to Shopify, and a warehouse feed that
-		// sends it is usually counting unfulfilled orders. Zero is the correct
-		// translation: the item is genuinely out.
-		if wanted < 0 {
-			wanted = 0
-		}
-		if wanted == item.Quantity {
-			continue
-		}
-
-		updates = append(updates, models.Update{InventoryItem: item, NewQuantity: wanted})
+// A SKU the warehouse does not mention is **left alone, not zeroed**. A feed
+// that does not name a SKU means "unknown", and translating not-knowing into
+// zero would empty every product that happens not to be registered in the
+// warehouse yet — precisely the most expensive mistake a system like this can
+// make.
+func Decide(item models.InventoryItem, warehouse map[string]int) (models.Update, bool) {
+	// A variant with no SKU cannot be matched against anything. One with no id
+	// or location cannot be written back.
+	if item.SKU == "" || item.InventoryItemID == "" || item.LocationID == "" {
+		return models.Update{}, false
 	}
 
-	// Sorted so change logs can be compared between syncs. Shopify does not
-	// promise a stable order.
-	sort.Slice(updates, func(i, j int) bool { return updates[i].SKU < updates[j].SKU })
-	return updates
+	wanted, known := warehouse[item.SKU]
+	if !known {
+		return models.Update{}, false
+	}
+	// Negative stock means nothing to Shopify, and a warehouse feed that sends
+	// it is usually counting unfulfilled orders. Zero is the correct
+	// translation: the item is genuinely out.
+	if wanted < 0 {
+		wanted = 0
+	}
+	if wanted == item.Quantity {
+		return models.Update{}, false
+	}
+
+	return models.Update{InventoryItem: item, NewQuantity: wanted}, true
 }
 
 // Run performs one full sync for a store.
@@ -117,6 +110,8 @@ func (s *SyncService) Run(ctx context.Context, domain, trigger string) (run mode
 	if err != nil {
 		return models.SyncRun{}, err
 	}
+
+	started := time.Now()
 
 	runID, err := queryOne(ctx, s.base, func(ctx context.Context) (int64, error) {
 		return s.runs.Start(ctx, domain, trigger)
@@ -152,8 +147,16 @@ func (s *SyncService) Run(ctx context.Context, domain, trigger string) (run mode
 	if syncErr != nil {
 		return models.SyncRun{}, syncErr
 	}
+
+	// The timestamps are filled in rather than left at their zero value. An
+	// answer that reports a run but dates it to year one is worse than one that
+	// says nothing: it looks like data, and anything reading it downstream has
+	// no way to tell that it is not.
+	finished := time.Now()
+
 	return models.SyncRun{
 		ID: runID, Shop: domain, Trigger: trigger,
+		StartedAt: started, FinishedAt: &finished,
 		Checked: checked, Updated: len(updates),
 	}, nil
 }
@@ -169,21 +172,33 @@ func (s *SyncService) reconcile(ctx context.Context, shop models.Shop) (checked 
 		return 0, nil, err
 	}
 
-	items, err := s.store.List(ctx, shop)
+	// Variants stream past one at a time and only the ones that differ are
+	// kept. A catalogue of any size is judged without ever being held; what
+	// stays in memory is the change list, which is as small as the store is
+	// already correct.
+	err = s.store.Each(ctx, shop, func(item models.InventoryItem) error {
+		checked++
+		if update, needed := Decide(item, stock); needed {
+			updates = append(updates, update)
+		}
+		return nil
+	})
 	if err != nil {
-		return 0, nil, err
+		return checked, nil, err
 	}
-	checked = len(items)
 
-	updates = Diff(items, stock)
 	if len(updates) == 0 {
 		return checked, nil, nil
 	}
 
+	// Sorted so change logs can be compared between syncs. Shopify does not
+	// promise a stable order.
+	sort.Slice(updates, func(i, j int) bool { return updates[i].SKU < updates[j].SKU })
+
 	if err := s.store.Apply(ctx, shop, updates); err != nil {
 		// Some batches may already have landed. What is returned is the error,
 		// and the history keeps its cause; the next sync finishes the rest,
-		// because Diff is always recomputed from the current state.
+		// because Decide is applied afresh to whatever the store holds by then.
 		return checked, nil, err
 	}
 	return checked, updates, nil

@@ -1,6 +1,11 @@
 package shopify
 
-import "testing"
+import (
+	"errors"
+	"testing"
+
+	"github.com/gemgum/shopify-warehouse-sync/internal/models"
+)
 
 // The lines below are copied verbatim from a real bulk result file, escaped
 // slashes and all. Hand-written fixtures would have quietly agreed with
@@ -27,15 +32,24 @@ func TestVariantsFoldsRealBulkOutput(t *testing.T) {
 		`{"location":{"id":"gid:\/\/shopify\/Location\/78313226343"},"quantities":[{"quantity":9}],"__parentId":"gid:\/\/shopify\/ProductVariant\/4"}`,
 	}
 
-	var v variants
+	var items []models.InventoryItem
+	v := variants{emit: func(item models.InventoryItem) error {
+		items = append(items, item)
+		return nil
+	}}
+
 	for _, raw := range lines {
 		line, err := decodeLine[bulkLine]([]byte(raw))
 		if err != nil {
 			t.Fatalf("line did not parse: %v", err)
 		}
-		v.add(line)
+		if err := v.add(line); err != nil {
+			t.Fatalf("add: %v", err)
+		}
 	}
-	items := v.done()
+	if err := v.done(); err != nil {
+		t.Fatalf("done: %v", err)
+	}
 
 	// Every variant is still counted as examined, even the ones left alone.
 	if len(items) != 4 {
@@ -69,20 +83,69 @@ func TestVariantsFoldsRealBulkOutput(t *testing.T) {
 // A file that ends right after a variant line, with its levels never arriving,
 // must not drop that variant on the floor.
 func TestVariantsHandlesATrailingVariant(t *testing.T) {
-	var v variants
+	var items []models.InventoryItem
+	v := variants{emit: func(item models.InventoryItem) error {
+		items = append(items, item)
+		return nil
+	}}
 
 	line, err := decodeLine[bulkLine]([]byte(
 		`{"id":"gid:\/\/shopify\/ProductVariant\/9","sku":"A","inventoryItem":{"id":"gid:\/\/x\/1","tracked":true}}`))
 	if err != nil {
 		t.Fatalf("line did not parse: %v", err)
 	}
-	v.add(line)
-
-	items := v.done()
+	if err := v.add(line); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	if err := v.done(); err != nil {
+		t.Fatalf("done: %v", err)
+	}
 	if len(items) != 1 {
 		t.Fatalf("got %d items, want 1", len(items))
 	}
 	if items[0].LocationID != "" {
 		t.Errorf("a variant stocked nowhere must not be syncable: %+v", items[0])
+	}
+}
+
+// Variants are handed over as they are read, not collected first. The proof is
+// that a caller can stop the walk partway: a slice-returning API would already
+// have built the whole catalogue before the caller ever saw the first item.
+func TestVariantsStopsWhenTheCallerStops(t *testing.T) {
+	lines := []string{
+		`{"id":"gid://v/1","sku":"A","inventoryItem":{"id":"gid://i/1","tracked":true}}`,
+		`{"location":{"id":"gid://l/1"},"quantities":[{"quantity":1}],"__parentId":"gid://v/1"}`,
+		`{"id":"gid://v/2","sku":"B","inventoryItem":{"id":"gid://i/2","tracked":true}}`,
+		`{"location":{"id":"gid://l/1"},"quantities":[{"quantity":2}],"__parentId":"gid://v/2"}`,
+		`{"id":"gid://v/3","sku":"C","inventoryItem":{"id":"gid://i/3","tracked":true}}`,
+	}
+
+	enough := errors.New("that is enough")
+
+	var seen []string
+	v := variants{emit: func(item models.InventoryItem) error {
+		seen = append(seen, item.SKU)
+		if item.SKU == "A" {
+			return enough
+		}
+		return nil
+	}}
+
+	var stopped error
+	for _, raw := range lines {
+		line, err := decodeLine[bulkLine]([]byte(raw))
+		if err != nil {
+			t.Fatalf("line did not parse: %v", err)
+		}
+		if stopped = v.add(line); stopped != nil {
+			break
+		}
+	}
+
+	if !errors.Is(stopped, enough) {
+		t.Fatalf("the caller's error did not stop the walk: %v", stopped)
+	}
+	if len(seen) != 1 || seen[0] != "A" {
+		t.Fatalf("saw %v, want only the first variant", seen)
 	}
 }

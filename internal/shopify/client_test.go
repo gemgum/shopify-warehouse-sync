@@ -152,9 +152,13 @@ func TestBulkDoesNotUseThePreviousOperationsResult(t *testing.T) {
 		}
 	})
 
-	items, err := c.List(context.Background(), shop)
+	var items []models.InventoryItem
+	err := c.Each(context.Background(), shop, func(item models.InventoryItem) error {
+		items = append(items, item)
+		return nil
+	})
 	if err != nil {
-		t.Fatalf("List failed: %v", err)
+		t.Fatalf("Each failed: %v", err)
 	}
 	if poll.Load() < 2 {
 		t.Fatal("the client accepted a bulk operation belonging to the previous sync")
@@ -182,7 +186,8 @@ func TestFailedBulkIsReportedAsAnError(t *testing.T) {
 		}
 	})
 
-	if _, err := c.List(context.Background(), shop); err == nil {
+	err := c.Each(context.Background(), shop, func(models.InventoryItem) error { return nil })
+	if err == nil {
 		t.Fatal("a FAILED bulk operation was reported as an empty store")
 	}
 }

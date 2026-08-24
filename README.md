@@ -65,6 +65,60 @@ shopify.web.toml         the command `shopify app dev` runs
 docs/                    how the pieces fit together, for a new reader
 ```
 
+## What runs where
+
+The diagram above says what talks to what. This one says what *runs* where —
+and where the line falls between what this repository owns and what it only
+borrows.
+
+```
+┌──────────── one machine ─────────────┐      ┌─────── Shopify's servers ───────┐
+│                                      │      │                                 │
+│  sync service (Go)      :8080        │─────▶│  Admin API                      │
+│  PostgreSQL (Docker)    :55432       │      │  the store's products, variants,│
+│  cloudflared            when needed  │◀─────│  SKUs, stock, orders            │
+│  warehouse.json         on disk      │      │  the dev dashboard              │
+│                                      │      │                                 │
+└──────────────────────────────────────┘      └─────────────────────────────────┘
+```
+
+Everything in this repository runs as one process next to one database. Shopify
+is rented, not owned: the store, its catalogue, and its inventory numbers live
+on Shopify's servers, and this service is a client that corrects those numbers.
+It holds no products and serves no storefront.
+
+**Traffic runs both ways, and that asymmetry is the whole reason a tunnel
+appears anywhere in this project.** Calls *out* to the Admin API work from any
+machine with a network connection. Calls *in* — the OAuth callback, and every
+webhook — are Shopify reaching the service, and `localhost` means nothing to
+Shopify. See [docs/how-it-fits-together.md](docs/how-it-fits-together.md) for
+how the tunnel closes that gap.
+
+### What the database is for
+
+Not a copy of the catalogue. Three tables, each holding something Shopify does
+not keep on our behalf:
+
+| Table | Holds | Why it cannot live in Shopify |
+|---|---|---|
+| `shops` | shop domain and its offline access token | Without a stored token, every sync would need a merchant sitting at a browser. This is what lets a sync run from cron at 3am |
+| `sync_runs` | every run, successful or not | Shopify has no idea a sync was attempted — least of all one that failed halfway |
+| `inventory_changes` | SKU, quantity before, quantity after | Shopify stores the number a variant has now, never the history of how it got there |
+
+That last row is the one that earns its keep. "Why does this show 12?" becomes a
+query rather than a guess.
+
+### Deployment
+
+Nothing here is deployed; it runs on a developer machine. Production would put
+the service in the container the `Dockerfile` already builds, swap the local
+Postgres for a managed one, replace the tunnel with a real domain, and point
+`WAREHOUSE_SOURCE` at the warehouse system's own endpoint.
+
+None of that touches the sync rules — which is why the feed is an interface
+(`models.WarehouseFeed`) rather than a file reader wired straight into the
+service.
+
 ## Technical highlights
 
 **OAuth 2.0 install flow.** Redirect to the merchant's store for consent,
@@ -78,7 +132,12 @@ computed over re-encoded text will never match.
 with a leaky bucket, so reading a full catalogue page by page spends most of
 its wall-clock waiting for the bucket to refill. The full read is submitted as
 a bulk query, polled with a backing-off interval, and streamed line by line
-from the resulting JSONL — never loaded whole into memory.
+from the resulting JSONL.
+
+The catalogue is never assembled. Variants are handed to the caller one at a
+time as their lines arrive, so a store of any size passes through while only
+the handful that actually differ are kept. A caller can stop the walk partway,
+which a slice-returning read could not offer.
 
 **Rate limiting that reads the actual budget.** Every GraphQL response carries
 `extensions.cost.throttleStatus`. The client waits on the reported remaining

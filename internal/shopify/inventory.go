@@ -70,60 +70,75 @@ type bulkLine struct {
 	ParentID string `json:"__parentId"`
 }
 
-// List reads a store's entire stock through the Bulk Operations API.
-func (c *Client) List(ctx context.Context, shop models.Shop) ([]models.InventoryItem, error) {
+// Each reads a store's entire stock and hands over one variant at a time.
+//
+// A callback rather than a returned slice, and that is the whole point: a
+// catalogue of any size passes through without ever being held. The JSONL is
+// read line by line, each variant is folded up as its lines arrive, and it is
+// gone again before the next one starts. What the caller keeps is its own
+// business — the sync keeps only the handful of variants that actually differ.
+func (c *Client) Each(ctx context.Context, shop models.Shop, fn func(models.InventoryItem) error) error {
 	url, err := c.runBulkQuery(ctx, shop, bulkVariantQuery)
 	if err != nil {
-		return nil, err
+		return err
 	}
 
-	var collected variants
+	seen := 0
+	collector := variants{emit: func(item models.InventoryItem) error {
+		seen++
+		return fn(item)
+	}}
 
 	err = c.eachBulkLine(ctx, url, func(raw []byte) error {
 		line, err := decodeLine[bulkLine](raw)
 		if err != nil {
 			return httpx.UpstreamError(fmt.Errorf("a bulk result line could not be read: %w", err))
 		}
-		collected.add(line)
-		return nil
+		return collector.add(line)
 	})
 	if err != nil {
-		return nil, err
+		return err
+	}
+	// The last variant has no following line to close it, so it is closed here.
+	if err := collector.done(); err != nil {
+		return err
 	}
 
-	items := collected.done()
-	c.logger.Debug("stock read", "shop", shop.Domain, "variants", len(items))
-
-	return items, nil
+	c.logger.Debug("stock read", "shop", shop.Domain, "variants", seen)
+	return nil
 }
 
 // variants turns the flat JSONL back into one item per variant.
 //
 // Shopify emits a variant, then that variant's inventory levels, then the next
-// variant — children always follow their parent — so the file can be folded up
-// as it streams, without holding all of it in memory.
+// variant — children always follow their parent. So a variant is complete the
+// moment the next one begins, and can be handed on immediately instead of
+// being collected.
 type variants struct {
-	items   []models.InventoryItem
+	emit    func(models.InventoryItem) error
 	current *models.InventoryItem
 	levels  int
 	tracked bool
 }
 
-// add folds one line into the item being built.
-func (v *variants) add(line bulkLine) {
+// add folds one line into the variant being built, emitting the previous one
+// once it is complete.
+func (v *variants) add(line bulkLine) error {
 	if line.InventoryItem != nil {
 		// A variant line: the previous variant is finished.
-		v.flush()
+		if err := v.flush(); err != nil {
+			return err
+		}
 		v.current = &models.InventoryItem{
 			SKU:             line.SKU,
 			InventoryItemID: line.InventoryItem.ID,
 		}
 		v.levels, v.tracked = 0, line.InventoryItem.Tracked
-		return
+		return nil
 	}
 
 	if v.current == nil || line.Location == nil {
-		return
+		return nil
 	}
 	v.levels++
 
@@ -135,9 +150,10 @@ func (v *variants) add(line bulkLine) {
 			v.current.Quantity = line.Quantities[0].Quantity
 		}
 	}
+	return nil
 }
 
-// flush closes off the variant being built.
+// flush hands the finished variant to the callback.
 //
 // **A variant is only syncable when its location is unambiguous.** Stock that
 // lives at two locations cannot be set from a feed that gives one number per
@@ -145,24 +161,24 @@ func (v *variants) add(line bulkLine) {
 // inventory. An untracked variant cannot be set at all; Shopify refuses the
 // mutation and takes the rest of the batch down with it.
 //
-// Both cases are kept in the list with no LocationID, so they still count as
-// examined, and Diff leaves them alone on the rule it already had.
-func (v *variants) flush() {
+// Both are still emitted, with no LocationID, so they count as examined — and
+// Decide leaves them alone on the rule it already had.
+func (v *variants) flush() error {
 	if v.current == nil {
-		return
+		return nil
 	}
 	if !v.tracked || v.levels != 1 {
 		v.current.LocationID = ""
 		v.current.Quantity = 0
 	}
-	v.items = append(v.items, *v.current)
+
+	item := *v.current
 	v.current = nil
+
+	return v.emit(item)
 }
 
-func (v *variants) done() []models.InventoryItem {
-	v.flush()
-	return v.items
-}
+func (v *variants) done() error { return v.flush() }
 
 // @idempotent is required on this mutation from API 2026-07 onward, and the
 // call is refused without it.
@@ -188,7 +204,7 @@ mutation Set($input: InventorySetQuantitiesInput!, $key: String!) {
 // It makes every write an optimistic check: if the stock moved between the bulk
 // read and this mutation, Shopify refuses rather than overwriting a number it
 // can see is newer than ours. That is the right behaviour for a stock writer,
-// and the loss is nothing — the next sync recomputes Diff from the current
+// and the loss is nothing — the next sync judges afresh from the current
 // state and puts through whatever is still owed.
 //
 // (Before 2026-07 the same call could opt out of the comparison entirely with

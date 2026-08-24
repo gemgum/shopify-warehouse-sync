@@ -27,8 +27,13 @@ type Update struct {
 // Shop is passed per call rather than held inside the implementation, because
 // one service serves many stores and the token belongs to the store — not to
 // the HTTP client talking to it.
+//
+// Each hands over one variant at a time instead of returning them all. A store
+// may hold a hundred thousand variants, and only the handful that differ are
+// worth keeping — so the ones that match stream past and are forgotten. An
+// error returned by fn stops the walk and comes back from Each.
 type StoreInventory interface {
-	List(ctx context.Context, shop Shop) ([]InventoryItem, error)
+	Each(ctx context.Context, shop Shop, fn func(InventoryItem) error) error
 	Apply(ctx context.Context, shop Shop, updates []Update) error
 }
 

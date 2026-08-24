@@ -64,9 +64,17 @@ type storeStub struct {
 	errApply error
 }
 
-func (s *storeStub) List(context.Context, models.Shop) ([]models.InventoryItem, error) {
+func (s *storeStub) Each(_ context.Context, _ models.Shop, fn func(models.InventoryItem) error) error {
 	s.reads++
-	return s.items, s.errList
+	if s.errList != nil {
+		return s.errList
+	}
+	for _, item := range s.items {
+		if err := fn(item); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *storeStub) Apply(_ context.Context, _ models.Shop, updates []models.Update) error {

@@ -1,7 +1,7 @@
 {
   "info": {
     "name": "Shopify Warehouse Sync",
-    "description": "A custom Shopify app that keeps a store's inventory in sync with an external warehouse system.\n\n**Every response uses the same envelope** — `code`, `status`, `message`, `data`. `status` is the category that says what to do next: `success`, `invalid_input`, `unauthorized`, `not_found`, `database_error`, `upstream_error`, `server_error`. `upstream_error` exists on its own because \"Shopify refused\" is neither the caller's fault nor a bug here — the answer is to retry later, not to fix the request.\n\n**Two different doors, two different guards.** Shopify's own calls prove themselves with an HMAC signature; the operator endpoints (`/sync`) carry `X-Sync-Token`, because nobody signs those. Requests in this collection are signed for you by pre-request scripts, so they work against a running service without hand-computing anything.\n\n**Before you start:** fill in `app_url`, `shop`, `api_secret`, and `sync_token` in the collection variables. `api_secret` must be the same value the service has in `SHOPIFY_API_SECRET`, or every signed request comes back `401`.",
+    "description": "A custom Shopify app that keeps a store's inventory in sync with an external warehouse system.\n\n**Every response uses the same envelope** — `code`, `status`, `message`, `data`. `status` is the category that says what to do next: `success`, `invalid_input`, `unauthorized`, `not_found`, `database_error`, `upstream_error`, `server_error`. `upstream_error` exists on its own because \"Shopify refused\" is neither the caller's fault nor a bug here — the answer is to retry later, not to fix the request.\n\n**Two different doors, two different guards.** Shopify's own calls prove themselves with an HMAC signature; the operator endpoints (`/sync`) carry `X-Sync-Token`, because nobody signs those. Requests in this collection are signed for you by pre-request scripts, so they work against a running service without hand-computing anything.\n\n**Before you start:** fill in `app_url`, `shop`, `api_secret`, and `sync_token` in the collection variables. `api_secret` must be the same value the service has in `SHOPIFY_API_SECRET`, or every signed request comes back `401`.\n\n**Where you put the variables does not matter.** The scripts read them with `pm.variables`, which looks through every scope — collection, environment, global — so a value typed into the wrong one still works. Postman's two columns do matter: *Current value* is what a request uses, and filling only *Initial value* leaves every signed request answering 401.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "auth": {
@@ -15,8 +15,8 @@
     },
     {
       "key": "shop",
-      "value": "my-store.myshopify.com",
-      "description": "The development store. Anything that is not a myshopify.com domain is refused at the door."
+      "value": "warehouse-sync-bp1nypd2.myshopify.com",
+      "description": "The development store. Anything that is not a myshopify.com domain is refused at the door — the value becomes the host this service calls."
     },
     {
       "key": "api_secret",
@@ -88,7 +88,88 @@
       "description": "The install handshake. Both addresses are open — they have to be, since the callers are Shopify and the merchant's browser — and both are guarded by an HMAC signature checked before anything is done.",
       "item": [
         {
-          "name": "Begin install",
+          "name": "Begin install (app root)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{app_url}}/?shop={{shop}}&timestamp={{install_timestamp}}&hmac={{install_hmac}}",
+              "host": [
+                "{{app_url}}"
+              ],
+              "path": [
+                ""
+              ],
+              "query": [
+                {
+                  "key": "shop",
+                  "value": "{{shop}}"
+                },
+                {
+                  "key": "timestamp",
+                  "value": "{{install_timestamp}}"
+                },
+                {
+                  "key": "hmac",
+                  "value": "{{install_hmac}}"
+                }
+              ]
+            },
+            "description": "**This is the address Shopify actually opens**, and the one that matters.\n\nAn app is launched at its `application_url` — the root — with `shop` and `hmac` appended. An app serving only `/install` answers that arrival with a 404, and the merchant never reaches the consent screen at all; the failure looks like nothing happened.\n\nThe root and `/install` are the same handler, so both are here: this one is the real entry point, the next is the same flow called directly."
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// The install request is signed too, not just the callback — an unsigned",
+                  "// one did not come from Shopify. Sorted params joined with '&', HMAC-SHA256,",
+                  "// hex encoded.",
+                  "const CryptoJS = require('crypto-js');",
+                  "",
+                  "const params = {",
+                  "    shop: pm.variables.get('shop'),",
+                  "    timestamp: String(Math.floor(Date.now() / 1000)),",
+                  "};",
+                  "",
+                  "const message = Object.keys(params).sort()",
+                  "    .map((key) => key + '=' + params[key])",
+                  "    .join('&');",
+                  "",
+                  "pm.collectionVariables.set('install_timestamp', params.timestamp);",
+                  "pm.collectionVariables.set('install_hmac',",
+                  "    CryptoJS.HmacSHA256(message, pm.variables.get('api_secret'))",
+                  "        .toString(CryptoJS.enc.Hex));"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('redirects to the merchant store for consent', () => {",
+                  "    pm.response.to.have.status(302);",
+                  "    pm.expect(pm.response.headers.get('Location'))",
+                  "        .to.include(pm.variables.get('shop') + '/admin/oauth/authorize');",
+                  "});",
+                  "",
+                  "// The nonce is what makes the callback provable later. Without it, someone",
+                  "// could walk a merchant through finishing an install for a different store.",
+                  "pm.test('sets the state nonce', () => {",
+                  "    pm.expect(pm.response.headers.get('Set-Cookie')).to.include('oauth_state=');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "protocolProfileBehavior": {
+            "followRedirects": false
+          }
+        },
+        {
+          "name": "Begin install (/install)",
           "request": {
             "method": "GET",
             "header": [],
@@ -115,7 +196,7 @@
                 }
               ]
             },
-            "description": "Verifies the signature, then redirects the merchant to their store for consent.\n\nRedirects are not followed here on purpose: what is worth checking is the `Location` header and the `state` cookie, not whatever Shopify's consent page returns."
+            "description": "The same handler as the root, reachable directly.\n\nUseful for testing the flow without Shopify launching it, and for an install link handed out by hand. Redirects are not followed here on purpose: what is worth checking is the `Location` header and the `state` cookie, not Shopify's consent page."
           },
           "event": [
             {
@@ -129,7 +210,7 @@
                   "const CryptoJS = require('crypto-js');",
                   "",
                   "const params = {",
-                  "    shop: pm.collectionVariables.get('shop'),",
+                  "    shop: pm.variables.get('shop'),",
                   "    timestamp: String(Math.floor(Date.now() / 1000)),",
                   "};",
                   "",
@@ -139,7 +220,7 @@
                   "",
                   "pm.collectionVariables.set('install_timestamp', params.timestamp);",
                   "pm.collectionVariables.set('install_hmac',",
-                  "    CryptoJS.HmacSHA256(message, pm.collectionVariables.get('api_secret'))",
+                  "    CryptoJS.HmacSHA256(message, pm.variables.get('api_secret'))",
                   "        .toString(CryptoJS.enc.Hex));"
                 ]
               }
@@ -152,7 +233,7 @@
                   "pm.test('redirects to the merchant store for consent', () => {",
                   "    pm.response.to.have.status(302);",
                   "    pm.expect(pm.response.headers.get('Location'))",
-                  "        .to.include(pm.collectionVariables.get('shop') + '/admin/oauth/authorize');",
+                  "        .to.include(pm.variables.get('shop') + '/admin/oauth/authorize');",
                   "});",
                   "",
                   "// The nonce is what makes the callback provable later. Without it, someone",
@@ -271,7 +352,20 @@
                   "",
                   "// Nothing to change is a perfectly good outcome, and it is the normal one",
                   "// on a second run. What matters is that the run was recorded either way.",
-                  "pm.test('the run was recorded', () => pm.expect(body.data.id).to.be.above(0));"
+                  "pm.test('the run was recorded', () => pm.expect(body.data.id).to.be.above(0));",
+                  "",
+                  "// A run that reports itself must say when it ran. These were once left at",
+                  "// their zero value, which reads as data rather than as absence.",
+                  "pm.test('the run is dated', () => {",
+                  "    pm.expect(Date.parse(body.data.started_at)).to.be.above(0);",
+                  "    pm.expect(Date.parse(body.data.finished_at)).to.be.at.least(Date.parse(body.data.started_at));",
+                  "});",
+                  "",
+                  "// Variants that are untracked, or stocked at more than one location, are",
+                  "// counted as examined and deliberately left alone — so updated <= checked,",
+                  "// and a second run of an unchanged feed reports zero.",
+                  "pm.test('updated never exceeds checked', () =>",
+                  "    pm.expect(body.data.updated).to.be.at.most(body.data.checked));"
                 ]
               }
             }
@@ -348,7 +442,7 @@
               "// that get sent.",
               "const CryptoJS = require('crypto-js');",
               "",
-              "const secret = pm.collectionVariables.get('api_secret');",
+              "const secret = pm.variables.get('api_secret');",
               "const raw = pm.variables.replaceIn(pm.request.body ? pm.request.body.raw : '');",
               "",
               "pm.request.headers.upsert({",
@@ -887,7 +981,7 @@
                   "const raw = pm.variables.replaceIn(pm.request.body.raw);",
                   "pm.request.headers.upsert({",
                   "    key: 'X-Shopify-Hmac-Sha256',",
-                  "    value: CryptoJS.HmacSHA256(raw, pm.collectionVariables.get('api_secret'))",
+                  "    value: CryptoJS.HmacSHA256(raw, pm.variables.get('api_secret'))",
                   "        .toString(CryptoJS.enc.Base64),",
                   "});"
                 ]
