@@ -1,0 +1,22 @@
+# Secrets. The Shopify app's API secret and the sync token live here, and either
+# one is enough to rewrite somebody's entire store inventory.
+.env
+.env.*
+!.env.example
+
+# Binaries from `go build` in the project folder. The name follows the module's.
+/shopify-warehouse-sync
+/service
+
+# Test binaries from `go test -c`, and coverage files.
+*.test
+coverage.out
+
+# A real warehouse feed used while trying things locally. The committed
+# warehouse.json is only a sample, and must not be overwritten with someone's
+# store data and then pushed.
+warehouse.local.json
+
+# Editor's, not the project's.
+.vscode/
+.idea/

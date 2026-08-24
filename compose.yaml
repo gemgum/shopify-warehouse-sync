@@ -1,0 +1,55 @@
+# How to run the service, and how to bring up a database while developing.
+#
+# `docker compose up -d postgres` is enough for local work: the service itself
+# is nicer to run through `make dev`, where recompiling is quick.
+
+services:
+  api:
+    image: shopify-warehouse-sync:latest
+    build: .
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+    # Settings come from the environment, not from a file baked into the image.
+    # The `.env` on a server is written once and never committed.
+    env_file: [.env]
+
+    ports:
+      - "8080:8080"
+
+    healthcheck:
+      # /healthz touches the database, so this is more than "the process is up".
+      test: ["CMD", "/service", "-healthcheck"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+    logging:
+      # Without a cap, this service's JSON logs will fill a small server's disk
+      # in a matter of months.
+      driver: json-file
+      options: { max-size: "10m", max-file: "5" }
+
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_PASSWORD: dev
+      POSTGRES_DB: shopify_sync
+    ports:
+      # A non-standard port so it does not collide with a Postgres that may
+      # already be running on the same machine.
+      - "55432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  pgdata:

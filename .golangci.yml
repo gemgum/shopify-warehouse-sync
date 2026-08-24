@@ -1,0 +1,20 @@
+# The checks that catch what the compiler lets through.
+#
+# The list is deliberately short. A noisy linter gets switched off entirely by
+# someone in a hurry, and after that nothing is guarding anything.
+version: "2"
+
+linters:
+  enable:
+    - errcheck      # errors dropped silently
+    - govet
+    - ineffassign   # values written and then never used
+    - staticcheck
+    - unused
+    - bodyclose     # HTTP bodies left unclosed — a slow leak
+    - rowserrcheck  # a missed rows.Err(): a broken query looks like an empty one
+    - sqlclosecheck
+
+formatters:
+  enable:
+    - gofmt

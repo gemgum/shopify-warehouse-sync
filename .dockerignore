@@ -1,0 +1,12 @@
+# What must not travel into the container.
+#
+# Not merely a matter of size: `.env` holds the Shopify app's API secret, and
+# copying it into the image means anyone who can pull that image can read it —
+# even though the file is never used while the service runs.
+
+.env
+.env.*
+!.env.example
+
+.git/
+*.log

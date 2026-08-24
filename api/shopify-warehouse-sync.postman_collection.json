@@ -1,0 +1,921 @@
+{
+  "info": {
+    "name": "Shopify Warehouse Sync",
+    "description": "A custom Shopify app that keeps a store's inventory in sync with an external warehouse system.\n\n**Every response uses the same envelope** — `code`, `status`, `message`, `data`. `status` is the category that says what to do next: `success`, `invalid_input`, `unauthorized`, `not_found`, `database_error`, `upstream_error`, `server_error`. `upstream_error` exists on its own because \"Shopify refused\" is neither the caller's fault nor a bug here — the answer is to retry later, not to fix the request.\n\n**Two different doors, two different guards.** Shopify's own calls prove themselves with an HMAC signature; the operator endpoints (`/sync`) carry `X-Sync-Token`, because nobody signs those. Requests in this collection are signed for you by pre-request scripts, so they work against a running service without hand-computing anything.\n\n**Before you start:** fill in `app_url`, `shop`, `api_secret`, and `sync_token` in the collection variables. `api_secret` must be the same value the service has in `SHOPIFY_API_SECRET`, or every signed request comes back `401`.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "auth": {
+    "type": "noauth"
+  },
+  "variable": [
+    {
+      "key": "app_url",
+      "value": "http://localhost:8080",
+      "description": "Where the service listens. Use the tunnel URL when testing the OAuth flow — Shopify requires HTTPS."
+    },
+    {
+      "key": "shop",
+      "value": "my-store.myshopify.com",
+      "description": "The development store. Anything that is not a myshopify.com domain is refused at the door."
+    },
+    {
+      "key": "api_secret",
+      "value": "",
+      "description": "SHOPIFY_API_SECRET. Used by the pre-request scripts to sign requests the way Shopify would."
+    },
+    {
+      "key": "sync_token",
+      "value": "",
+      "description": "SYNC_TOKEN. Guards the operator endpoints, which can rewrite a whole store's inventory."
+    },
+    {
+      "key": "install_timestamp",
+      "value": ""
+    },
+    {
+      "key": "install_hmac",
+      "value": ""
+    }
+  ],
+  "item": [
+    {
+      "name": "0 · Open",
+      "description": "No signature, no token. The only address in the service that asks nothing of the caller.",
+      "item": [
+        {
+          "name": "Health",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{app_url}}/healthz",
+              "host": [
+                "{{app_url}}"
+              ],
+              "path": [
+                "healthz"
+              ]
+            },
+            "description": "Touches the database on the way through. An address that only reports \"the process is alive\" would still say healthy while Postgres is down — and at that moment no sync may run at all, because none of it could be recorded."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "",
+                  "// Every response uses the same envelope: code, status, message, data.",
+                  "pm.test('envelope is intact', () => {",
+                  "    pm.expect(body).to.have.all.keys('code', 'status', 'message', 'data');",
+                  "    pm.expect(body.code).to.eql(pm.response.code);",
+                  "});",
+                  "",
+                  "pm.test('service and database are both up', () => {",
+                  "    pm.response.to.have.status(200);",
+                  "    pm.expect(body.status).to.eql('success');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "1 · Install (OAuth 2.0)",
+      "description": "The install handshake. Both addresses are open — they have to be, since the callers are Shopify and the merchant's browser — and both are guarded by an HMAC signature checked before anything is done.",
+      "item": [
+        {
+          "name": "Begin install",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{app_url}}/install?shop={{shop}}&timestamp={{install_timestamp}}&hmac={{install_hmac}}",
+              "host": [
+                "{{app_url}}"
+              ],
+              "path": [
+                "install"
+              ],
+              "query": [
+                {
+                  "key": "shop",
+                  "value": "{{shop}}"
+                },
+                {
+                  "key": "timestamp",
+                  "value": "{{install_timestamp}}"
+                },
+                {
+                  "key": "hmac",
+                  "value": "{{install_hmac}}"
+                }
+              ]
+            },
+            "description": "Verifies the signature, then redirects the merchant to their store for consent.\n\nRedirects are not followed here on purpose: what is worth checking is the `Location` header and the `state` cookie, not whatever Shopify's consent page returns."
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// The install request is signed too, not just the callback — an unsigned",
+                  "// one did not come from Shopify. Sorted params joined with '&', HMAC-SHA256,",
+                  "// hex encoded.",
+                  "const CryptoJS = require('crypto-js');",
+                  "",
+                  "const params = {",
+                  "    shop: pm.collectionVariables.get('shop'),",
+                  "    timestamp: String(Math.floor(Date.now() / 1000)),",
+                  "};",
+                  "",
+                  "const message = Object.keys(params).sort()",
+                  "    .map((key) => key + '=' + params[key])",
+                  "    .join('&');",
+                  "",
+                  "pm.collectionVariables.set('install_timestamp', params.timestamp);",
+                  "pm.collectionVariables.set('install_hmac',",
+                  "    CryptoJS.HmacSHA256(message, pm.collectionVariables.get('api_secret'))",
+                  "        .toString(CryptoJS.enc.Hex));"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('redirects to the merchant store for consent', () => {",
+                  "    pm.response.to.have.status(302);",
+                  "    pm.expect(pm.response.headers.get('Location'))",
+                  "        .to.include(pm.collectionVariables.get('shop') + '/admin/oauth/authorize');",
+                  "});",
+                  "",
+                  "// The nonce is what makes the callback provable later. Without it, someone",
+                  "// could walk a merchant through finishing an install for a different store.",
+                  "pm.test('sets the state nonce', () => {",
+                  "    pm.expect(pm.response.headers.get('Set-Cookie')).to.include('oauth_state=');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "protocolProfileBehavior": {
+            "followRedirects": false
+          }
+        },
+        {
+          "name": "Callback",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{app_url}}/auth/callback?shop={{shop}}&code=REPLACE_ME&state=REPLACE_ME&hmac=REPLACE_ME",
+              "host": [
+                "{{app_url}}"
+              ],
+              "path": [
+                "auth",
+                "callback"
+              ],
+              "query": [
+                {
+                  "key": "shop",
+                  "value": "{{shop}}"
+                },
+                {
+                  "key": "code",
+                  "value": "REPLACE_ME"
+                },
+                {
+                  "key": "state",
+                  "value": "REPLACE_ME"
+                },
+                {
+                  "key": "hmac",
+                  "value": "REPLACE_ME"
+                }
+              ]
+            },
+            "description": "**Cannot be replayed by hand, and that is the point.**\n\nShopify drives this address: it arrives with a one-time authorization code, an HMAC over the whole query, and a `state` that must match the cookie set by *Begin install* in the same browser. Forging all three is exactly what the flow is designed to prevent.\n\nKept here as documentation of the shape. To exercise it for real, open the install link in a browser and let Shopify redirect you back."
+          }
+        }
+      ]
+    },
+    {
+      "name": "2 · Operator",
+      "description": "Called by a person or a scheduler, never by Shopify — so there is no signature to check, and `X-Sync-Token` guards them instead. `/sync` can rewrite a whole store's inventory in one call, which is why the service refuses to start if that token is shorter than 32 characters.",
+      "auth": {
+        "type": "apikey",
+        "apikey": [
+          {
+            "key": "key",
+            "value": "X-Sync-Token"
+          },
+          {
+            "key": "value",
+            "value": "{{sync_token}}"
+          },
+          {
+            "key": "in",
+            "value": "header"
+          }
+        ]
+      },
+      "item": [
+        {
+          "name": "Run a sync",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{app_url}}/sync?shop={{shop}}",
+              "host": [
+                "{{app_url}}"
+              ],
+              "path": [
+                "sync"
+              ],
+              "query": [
+                {
+                  "key": "shop",
+                  "value": "{{shop}}"
+                }
+              ]
+            },
+            "description": "Reads the warehouse feed, reads every variant through the Bulk Operations API, reconciles the two, and writes the differences back.\n\nWaits for the result, unlike the webhook path — the caller here asked precisely because they want to know the outcome. A large catalogue can take a while: the bulk job runs on Shopify's side and is polled until it finishes."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "",
+                  "// Every response uses the same envelope: code, status, message, data.",
+                  "pm.test('envelope is intact', () => {",
+                  "    pm.expect(body).to.have.all.keys('code', 'status', 'message', 'data');",
+                  "    pm.expect(body.code).to.eql(pm.response.code);",
+                  "});",
+                  "",
+                  "pm.test('sync completed', () => {",
+                  "    pm.response.to.have.status(200);",
+                  "    pm.expect(body.data.checked).to.be.a('number');",
+                  "    pm.expect(body.data.updated).to.be.a('number');",
+                  "});",
+                  "",
+                  "// Nothing to change is a perfectly good outcome, and it is the normal one",
+                  "// on a second run. What matters is that the run was recorded either way.",
+                  "pm.test('the run was recorded', () => pm.expect(body.data.id).to.be.above(0));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Sync history",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{app_url}}/sync/history?shop={{shop}}&limit=20",
+              "host": [
+                "{{app_url}}"
+              ],
+              "path": [
+                "sync",
+                "history"
+              ],
+              "query": [
+                {
+                  "key": "shop",
+                  "value": "{{shop}}"
+                },
+                {
+                  "key": "limit",
+                  "value": "20"
+                }
+              ]
+            },
+            "description": "Newest first. This is what answers \"why does this show 4?\" without opening the database.\n\nRuns that failed are here too, with the reason — they are written before the work starts, so a sync that died halfway still left a trace. A run whose `finished_at` is null is one that never got to close: the service was killed mid-sync."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "",
+                  "// Every response uses the same envelope: code, status, message, data.",
+                  "pm.test('envelope is intact', () => {",
+                  "    pm.expect(body).to.have.all.keys('code', 'status', 'message', 'data');",
+                  "    pm.expect(body.code).to.eql(pm.response.code);",
+                  "});",
+                  "",
+                  "pm.test('history is a list', () => {",
+                  "    pm.response.to.have.status(200);",
+                  "    pm.expect(body.data).to.be.an('array');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "3 · Webhooks",
+      "description": "Everything Shopify calls. Each request in this folder is signed for you before it is sent — see the folder's pre-request script.\n\nThe first two are registered by the service itself during install. The three GDPR topics are mandatory for public apps and are configured in the Partner dashboard; this app stores no customer data, and its answers say so plainly rather than inventing something to return.",
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "// Shopify signs the raw request body with the app's API secret, and the",
+              "// service refuses anything that does not match. Signing it here is what",
+              "// makes these requests the real thing rather than a stub that only works",
+              "// because verification was skipped.",
+              "//",
+              "// The body is resolved first: {{shop}} inside the JSON must be replaced",
+              "// before it is signed, or the bytes that are signed are not the bytes",
+              "// that get sent.",
+              "const CryptoJS = require('crypto-js');",
+              "",
+              "const secret = pm.collectionVariables.get('api_secret');",
+              "const raw = pm.variables.replaceIn(pm.request.body ? pm.request.body.raw : '');",
+              "",
+              "pm.request.headers.upsert({",
+              "    key: 'X-Shopify-Hmac-Sha256',",
+              "    value: CryptoJS.HmacSHA256(raw, secret).toString(CryptoJS.enc.Base64),",
+              "});",
+              "",
+              "// The shop domain travels in a header because the inventory payload never",
+              "// names the shop. The header is NOT covered by the signature, which is why",
+              "// the service treats it as untrusted input and validates its shape.",
+              "pm.request.headers.upsert({",
+              "    key: 'X-Shopify-Shop-Domain',",
+              "    value: pm.variables.replaceIn('{{shop}}'),",
+              "});"
+            ]
+          }
+        }
+      ],
+      "item": [
+        {
+          "name": "inventory_levels/update",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{app_url}}/webhooks/inventory_levels_update",
+              "host": [
+                "{{app_url}}"
+              ],
+              "path": [
+                "webhooks",
+                "inventory_levels_update"
+              ]
+            },
+            "description": "Stock moved on Shopify's side. If it was not this service that moved it, the store and the warehouse have started to drift — which is exactly when a sync is worth running.\n\nAnswers `202` immediately and queues the work. Shopify drops any connection it cannot finish in five seconds and re-delivers, and a full sync is far longer than that — so a webhook that waited would be re-sent, piling up syncs that all do the same thing.\n\nSending this one twice in a row queues one sync, not two.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"inventory_item_id\": 808950810,\n  \"location_id\": 655441491,\n  \"available\": 7,\n  \"updated_at\": \"2026-08-24T09:12:33-04:00\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "",
+                  "// Every response uses the same envelope: code, status, message, data.",
+                  "pm.test('envelope is intact', () => {",
+                  "    pm.expect(body).to.have.all.keys('code', 'status', 'message', 'data');",
+                  "    pm.expect(body.code).to.eql(pm.response.code);",
+                  "});",
+                  "",
+                  "pm.test('accepted without waiting for the sync', () => {",
+                  "    pm.response.to.have.status(202);",
+                  "    pm.expect(body.status).to.eql('success');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "app/uninstalled",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{app_url}}/webhooks/app_uninstalled",
+              "host": [
+                "{{app_url}}"
+              ],
+              "path": [
+                "webhooks",
+                "app_uninstalled"
+              ]
+            },
+            "description": "**Changes state.** Marks the shop uninstalled and clears its token.\n\nThe token is already dead by the time this arrives; without the mark, every later sync would hit a 401 and look like a broken service. The row is revoked, not deleted — the sync history points at it, and history pointing at a row that no longer exists cannot be read.\n\nRe-install through the OAuth flow to undo this.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"id\": 954889,\n  \"name\": \"Example Store\",\n  \"domain\": \"{{shop}}\",\n  \"myshopify_domain\": \"{{shop}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "",
+                  "// Every response uses the same envelope: code, status, message, data.",
+                  "pm.test('envelope is intact', () => {",
+                  "    pm.expect(body).to.have.all.keys('code', 'status', 'message', 'data');",
+                  "    pm.expect(body.code).to.eql(pm.response.code);",
+                  "});",
+                  "",
+                  "pm.test('shop marked as uninstalled', () => {",
+                  "    pm.response.to.have.status(200);",
+                  "    pm.expect(body.status).to.eql('success');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "customers/data_request (GDPR)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{app_url}}/webhooks/customers_data_request",
+              "host": [
+                "{{app_url}}"
+              ],
+              "path": [
+                "webhooks",
+                "customers_data_request"
+              ]
+            },
+            "description": "A merchant asks for a copy of a customer's data. This app holds none — what it stores is a shop domain, a token, and per-SKU stock changes — so the answer says exactly that.\n\nThe signature is still checked. The address is open on the internet like any other webhook, and answering `200` to anyone who asks would make the check decorative.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"shop_id\": 954889,\n  \"shop_domain\": \"{{shop}}\",\n  \"orders_requested\": [\n    299938\n  ],\n  \"customer\": {\n    \"id\": 191167,\n    \"email\": \"john@example.com\",\n    \"phone\": \"555-625-1199\"\n  },\n  \"data_request\": {\n    \"id\": 9999\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "",
+                  "// Every response uses the same envelope: code, status, message, data.",
+                  "pm.test('envelope is intact', () => {",
+                  "    pm.expect(body).to.have.all.keys('code', 'status', 'message', 'data');",
+                  "    pm.expect(body.code).to.eql(pm.response.code);",
+                  "});",
+                  "",
+                  "pm.test('answered honestly', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "customers/redact (GDPR)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{app_url}}/webhooks/customers_redact",
+              "host": [
+                "{{app_url}}"
+              ],
+              "path": [
+                "webhooks",
+                "customers_redact"
+              ]
+            },
+            "description": "A customer asks to be erased. Nothing to erase here, and the answer says so.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"shop_id\": 954889,\n  \"shop_domain\": \"{{shop}}\",\n  \"customer\": {\n    \"id\": 191167,\n    \"email\": \"john@example.com\",\n    \"phone\": \"555-625-1199\"\n  },\n  \"orders_to_redact\": [\n    299938\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "",
+                  "// Every response uses the same envelope: code, status, message, data.",
+                  "pm.test('envelope is intact', () => {",
+                  "    pm.expect(body).to.have.all.keys('code', 'status', 'message', 'data');",
+                  "    pm.expect(body.code).to.eql(pm.response.code);",
+                  "});",
+                  "",
+                  "pm.test('answered honestly', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "shop/redact (GDPR)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{app_url}}/webhooks/shop_redact",
+              "host": [
+                "{{app_url}}"
+              ],
+              "path": [
+                "webhooks",
+                "shop_redact"
+              ]
+            },
+            "description": "**Changes state.** Arrives 48 hours after an uninstall, and here it does something real: the shop is marked uninstalled and its token is cleared.\n\nThe sync history stays. It holds SKUs and quantities — nobody's personal data.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"shop_id\": 954889,\n  \"shop_domain\": \"{{shop}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "",
+                  "// Every response uses the same envelope: code, status, message, data.",
+                  "pm.test('envelope is intact', () => {",
+                  "    pm.expect(body).to.have.all.keys('code', 'status', 'message', 'data');",
+                  "    pm.expect(body.code).to.eql(pm.response.code);",
+                  "});",
+                  "",
+                  "pm.test('shop credentials removed', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "4 · Must fail",
+      "description": "The guards, exercised on purpose. A collection where everything passes proves the happy path works; these prove the doors are actually shut.\n\nEvery request here is expected to be refused. A green run means the service is behaving.",
+      "item": [
+        {
+          "name": "Sync without a token",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{app_url}}/sync?shop={{shop}}",
+              "host": [
+                "{{app_url}}"
+              ],
+              "path": [
+                "sync"
+              ],
+              "query": [
+                {
+                  "key": "shop",
+                  "value": "{{shop}}"
+                }
+              ]
+            },
+            "description": "No `X-Sync-Token`. This address can rewrite a whole store's inventory, so an unauthenticated caller must never get past the header check."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "",
+                  "// Every response uses the same envelope: code, status, message, data.",
+                  "pm.test('envelope is intact', () => {",
+                  "    pm.expect(body).to.have.all.keys('code', 'status', 'message', 'data');",
+                  "    pm.expect(body.code).to.eql(pm.response.code);",
+                  "});",
+                  "",
+                  "pm.test('refused', () => {",
+                  "    pm.response.to.have.status(401);",
+                  "    pm.expect(body.status).to.eql('unauthorized');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Sync with the wrong token",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "X-Sync-Token",
+                "value": "0000000000000000000000000000000000000000000"
+              }
+            ],
+            "url": {
+              "raw": "{{app_url}}/sync?shop={{shop}}",
+              "host": [
+                "{{app_url}}"
+              ],
+              "path": [
+                "sync"
+              ],
+              "query": [
+                {
+                  "key": "shop",
+                  "value": "{{shop}}"
+                }
+              ]
+            },
+            "description": "A token of the right shape but the wrong value. Compared in constant time — an ordinary comparison leaks how many leading characters were already right, which is enough to guess it piece by piece."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "",
+                  "// Every response uses the same envelope: code, status, message, data.",
+                  "pm.test('envelope is intact', () => {",
+                  "    pm.expect(body).to.have.all.keys('code', 'status', 'message', 'data');",
+                  "    pm.expect(body.code).to.eql(pm.response.code);",
+                  "});",
+                  "",
+                  "pm.test('refused', () => {",
+                  "    pm.response.to.have.status(401);",
+                  "    pm.expect(body.status).to.eql('unauthorized');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Sync a domain that is not myshopify.com",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "X-Sync-Token",
+                "value": "{{sync_token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{app_url}}/sync?shop=attacker.example.com",
+              "host": [
+                "{{app_url}}"
+              ],
+              "path": [
+                "sync"
+              ],
+              "query": [
+                {
+                  "key": "shop",
+                  "value": "attacker.example.com"
+                }
+              ]
+            },
+            "description": "The `shop` value becomes the host this service calls (`https://<shop>/admin/…`) and the OAuth redirect target. Without this check, a crafted request would send the authorization code — and later the token — somewhere else entirely."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "",
+                  "// Every response uses the same envelope: code, status, message, data.",
+                  "pm.test('envelope is intact', () => {",
+                  "    pm.expect(body).to.have.all.keys('code', 'status', 'message', 'data');",
+                  "    pm.expect(body.code).to.eql(pm.response.code);",
+                  "});",
+                  "",
+                  "pm.test('refused before anything is called', () => {",
+                  "    pm.response.to.have.status(400);",
+                  "    pm.expect(body.status).to.eql('invalid_input');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Webhook with a forged signature",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-Shopify-Shop-Domain",
+                "value": "{{shop}}"
+              },
+              {
+                "key": "X-Shopify-Hmac-Sha256",
+                "value": "bm90LWEtcmVhbC1zaWduYXR1cmUtYXQtYWxsLW5vcGU="
+              }
+            ],
+            "url": {
+              "raw": "{{app_url}}/webhooks/inventory_levels_update",
+              "host": [
+                "{{app_url}}"
+              ],
+              "path": [
+                "webhooks",
+                "inventory_levels_update"
+              ]
+            },
+            "description": "A well-formed Shopify payload with a signature that does not match. This is the one guard standing between a public URL and a stranger triggering syncs at will.\n\nNote this folder does not sign anything — the header below is set deliberately wrong.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"inventory_item_id\": 808950810,\n  \"location_id\": 655441491,\n  \"available\": 7\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "",
+                  "// Every response uses the same envelope: code, status, message, data.",
+                  "pm.test('envelope is intact', () => {",
+                  "    pm.expect(body).to.have.all.keys('code', 'status', 'message', 'data');",
+                  "    pm.expect(body.code).to.eql(pm.response.code);",
+                  "});",
+                  "",
+                  "pm.test('refused', () => {",
+                  "    pm.response.to.have.status(401);",
+                  "    pm.expect(body.status).to.eql('unauthorized');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Webhook without a shop header",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{app_url}}/webhooks/inventory_levels_update",
+              "host": [
+                "{{app_url}}"
+              ],
+              "path": [
+                "webhooks",
+                "inventory_levels_update"
+              ]
+            },
+            "description": "The inventory payload never names the shop, so the domain travels in a header — and that header is **not** covered by the signature. It is treated as untrusted input and its shape is checked before a single query runs.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"inventory_item_id\": 808950810,\n  \"location_id\": 655441491,\n  \"available\": 7\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// Sign the body correctly, but send no shop header. The signature being",
+                  "// valid is exactly what makes this case interesting: it isolates the",
+                  "// header check from the signature check.",
+                  "const CryptoJS = require('crypto-js');",
+                  "",
+                  "const raw = pm.variables.replaceIn(pm.request.body.raw);",
+                  "pm.request.headers.upsert({",
+                  "    key: 'X-Shopify-Hmac-Sha256',",
+                  "    value: CryptoJS.HmacSHA256(raw, pm.collectionVariables.get('api_secret'))",
+                  "        .toString(CryptoJS.enc.Base64),",
+                  "});"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "",
+                  "// Every response uses the same envelope: code, status, message, data.",
+                  "pm.test('envelope is intact', () => {",
+                  "    pm.expect(body).to.have.all.keys('code', 'status', 'message', 'data');",
+                  "    pm.expect(body.code).to.eql(pm.response.code);",
+                  "});",
+                  "",
+                  "pm.test('refused', () => {",
+                  "    pm.response.to.have.status(400);",
+                  "    pm.expect(body.status).to.eql('invalid_input');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,38 @@
+# The same gate as `make lint test`, run on every push.
+#
+# No database is started here, deliberately: what is tested is the sync rules
+# and signature verification, and neither needs Postgres — which is precisely
+# the point of separating the layers.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+
+      - name: gofmt
+        # `gofmt -l` never fails on its own — it only names files. Without this
+        # line, unformatted files sail through unnoticed.
+        run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test
+        run: go test -race ./...
+
+      - name: docker build
+        run: docker build -t shopify-warehouse-sync:ci .
