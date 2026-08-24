@@ -1,0 +1,20 @@
+# How the Shopify CLI starts this service.
+#
+# `shopify app dev` opens a tunnel, then runs the command below with the app's
+# credentials and the tunnel address already in the environment — so nothing has
+# to be copied by hand into .env for a development run.
+#
+# Both roles, for one process, and the reason is the CLI's dev proxy rather than
+# anything about the app. That proxy sits between the tunnel and this service and
+# routes by role: a `backend` gets `/api/*`, while `/` — where Shopify actually
+# opens an app — goes to the `frontend`. Declaring only `backend` leaves the root
+# unrouted, and the browser lands on the proxy's own "Invalid path" instead of
+# the OAuth redirect.
+#
+# There is no separate frontend here. This app has no screen inside the Shopify
+# admin; the root is simply where its install flow begins.
+
+roles = ["frontend", "backend"]
+
+[commands]
+dev = "go run ./cmd/api"

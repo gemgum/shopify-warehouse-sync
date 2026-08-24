@@ -38,7 +38,7 @@ func testClient(t *testing.T, handler http.HandlerFunc) (*Client, models.Shop) {
 	server := httptest.NewServer(handler)
 	t.Cleanup(server.Close)
 
-	c := New(Options{APIVersion: "2025-01", APISecret: "hush"}, slog.New(slog.DiscardHandler))
+	c := New(Options{APIVersion: "2026-07", APISecret: "hush"}, slog.New(slog.DiscardHandler))
 	c.http = &http.Client{Transport: redirector{server.URL}}
 
 	return c, models.Shop{Domain: "uji.myshopify.com", AccessToken: "shpat_uji"}
@@ -125,7 +125,9 @@ func TestBulkDoesNotUseThePreviousOperationsResult(t *testing.T) {
 
 	c, shop := testClient(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/fresh-result.jsonl" {
-			_, _ = io.WriteString(w, `{"sku":"A","inventoryQuantity":5,"inventoryItem":{"id":"gid://i/1"}}`+"\n")
+			_, _ = io.WriteString(w,
+				`{"id":"gid://v/1","sku":"A","inventoryItem":{"id":"gid://i/1","tracked":true}}`+"\n"+
+					`{"location":{"id":"gid://l/1"},"quantities":[{"quantity":5}],"__parentId":"gid://v/1"}`+"\n")
 			return
 		}
 
@@ -144,9 +146,6 @@ func TestBulkDoesNotUseThePreviousOperationsResult(t *testing.T) {
 				return
 			}
 			writeGraphQL(w, `{"currentBulkOperation":{"id":"gid://bulk/BARU","status":"COMPLETED","url":"http://x/fresh-result.jsonl","objectCount":"1"}}`)
-
-		case strings.Contains(query, "locations"):
-			writeGraphQL(w, `{"locations":{"nodes":[{"id":"gid://l/1"}]}}`)
 
 		default:
 			t.Errorf("unexpected query: %s", query)
@@ -180,25 +179,11 @@ func TestFailedBulkIsReportedAsAnError(t *testing.T) {
 			writeGraphQL(w, `{"bulkOperationRunQuery":{"bulkOperation":{"id":"gid://bulk/1","status":"CREATED"},"userErrors":[]}}`)
 		case strings.Contains(query, "currentBulkOperation"):
 			writeGraphQL(w, `{"currentBulkOperation":{"id":"gid://bulk/1","status":"FAILED","errorCode":"INTERNAL_SERVER_ERROR"}}`)
-		case strings.Contains(query, "locations"):
-			writeGraphQL(w, `{"locations":{"nodes":[{"id":"gid://l/1"}]}}`)
 		}
 	})
 
 	if _, err := c.List(context.Background(), shop); err == nil {
 		t.Fatal("a FAILED bulk operation was reported as an empty store")
-	}
-}
-
-// A store with no active location cannot be written to. If this got through,
-// every following mutation would be sent with an empty locationId.
-func TestListRejectsAStoreWithNoLocation(t *testing.T) {
-	c, shop := testClient(t, func(w http.ResponseWriter, r *http.Request) {
-		writeGraphQL(w, `{"locations":{"nodes":[]}}`)
-	})
-
-	if _, err := c.List(context.Background(), shop); err == nil {
-		t.Fatal("a store with no active location was accepted")
 	}
 }
 

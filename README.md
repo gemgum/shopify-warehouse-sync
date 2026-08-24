@@ -59,6 +59,10 @@ internal/database/       pool, transactions, embedded migrations
 internal/problem/        Postgres errors → service errors
 pkg/httpx/               one response envelope, one error type
 pkg/middleware/          recover, request log
+
+shopify.app.toml         app config: urls, scopes, compliance webhooks
+shopify.web.toml         the command `shopify app dev` runs
+docs/                    how the pieces fit together, for a new reader
 ```
 
 ## Technical highlights
@@ -87,6 +91,12 @@ finish in five seconds and re-delivers, so an inventory webhook only enqueues a
 sync and replies `202`. A single background worker drains the queue — matching
 Shopify's rule that one shop may run one bulk operation at a time.
 
+**Written against a live API, not from memory.** `inventorySetQuantities` on
+2026-07 requires `changeFromQuantity` — every write states the quantity it read,
+so a stock movement between the bulk read and the mutation is refused rather
+than overwritten — and an `@idempotent` key, minted once per batch so the
+throttle retry cannot apply the same change twice.
+
 **Auditable sync.** The `sync_runs` row is written *before* the work starts, so
 a run that dies halfway still leaves a trace. The change log and the run's
 closing row commit in one transaction: a run that claims twelve changes can
@@ -105,7 +115,8 @@ PostgreSQL · Docker · GitHub Actions
 
 ```
 GET  /healthz                            liveness — touches the database
-GET  /install                            OAuth 2.0 install
+GET  /                                   OAuth 2.0 install — where Shopify opens the app
+GET  /install                            OAuth 2.0 install, called directly
 GET  /auth/callback                      OAuth 2.0 callback
 POST /sync?shop=…                        full sync, waits for the result
 GET  /sync/history?shop=…                what changed, and when
@@ -121,9 +132,24 @@ Everything else is either signed by Shopify or open by design.
 
 ## Running it
 
+New to Shopify apps, tunnels, or why either is needed?
+[docs/how-it-fits-together.md](docs/how-it-fits-together.md) explains the whole
+picture before the commands.
+
+The short path, letting the Shopify CLI open the tunnel and inject credentials:
+
 ```bash
-cp .env.example .env    # fill in the app credentials
+cp .env.example .env    # DATABASE_URL and SYNC_TOKEN only
 make db                 # Postgres on :55432
+make test
+make cli                # shopify app dev, tunnel and credentials included
+```
+
+Or run every piece yourself:
+
+```bash
+cp .env.example .env    # fill in the app credentials too
+make db
 make test
 make dev
 ```
@@ -155,9 +181,14 @@ where run_id = (select max(id) from sync_runs where shop = 'my-store.myshopify.c
 
 ## Known limits
 
-- **One location per store.** Stock is written to the first active location.
-  Multi-warehouse stores need the location mapping to come from the warehouse
-  feed itself — a change to the feed's shape, not to the sync rules.
+- **A variant is synced only where its location is unambiguous.** Stock split
+  across two locations cannot be set from a feed that gives one number per SKU
+  — dividing it would be a guess, and a wrong guess quietly moves real
+  inventory. Such variants are counted as examined and left alone. Supporting
+  them means the feed itself has to name locations, which is a change to the
+  feed's shape rather than to the sync rules.
+- **Untracked variants are skipped.** Shopify refuses to set a quantity on
+  them, and one refusal fails the whole batch.
 - **One background worker for all shops.** Correct while a handful of stores are
   installed; beyond that the fix is one worker per shop, not more workers.
 - Metafields, Metaobjects, and the Storefront API are not used here.

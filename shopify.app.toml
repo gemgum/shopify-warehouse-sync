@@ -1,0 +1,89 @@
+# The app's configuration, as Shopify stores it.
+#
+# This file is the source of truth, not the dashboard. `shopify app deploy`
+# turns it into a new app version; the dashboard's Versions card is where that
+# version shows up. Editing settings in the browser and editing this file are
+# two doors to the same room, and keeping the file authoritative is what makes
+# the configuration reviewable in git alongside the code it describes.
+
+client_id = "dc1783c94d1b5b6de28958748dd60255"
+name = "warehouse-sync"
+
+# `handle` is deliberately absent. Shopify assigns one when the app is created
+# and requires it to be unique; asserting a value here only risks colliding with
+# an app that already holds it, and the error says nothing about which.
+
+# Not an embedded app. There is no admin UI here — no App Bridge, no Polaris,
+# no screen inside Shopify's dashboard. This service is a backend that talks to
+# the Admin API and answers webhooks, so declaring it embedded would promise a
+# surface that does not exist.
+embedded = false
+
+# Overwritten by `shopify app dev`, which starts a tunnel and points these at
+# it. The value committed here is only a placeholder for a fresh clone.
+application_url = "https://example.trycloudflare.com"
+
+[access_scopes]
+# read_products  — to page through variants and their SKUs
+# read_inventory — to read current levels
+# write_inventory— to set them from the warehouse feed
+#
+# Nothing more. A scope that is never used only widens what is lost if the
+# token leaks, and every addition forces the merchant to approve again.
+scopes = "read_products,read_inventory,write_inventory"
+
+[auth]
+# Must match what the service serves and what it sends to Shopify at authorize
+# time. All three come from config.CallbackURL() in the code; here it is
+# spelled out because Shopify checks the incoming redirect_uri against this
+# list exactly — one slash apart and the whole install is refused.
+redirect_urls = [ "https://example.trycloudflare.com/auth/callback" ]
+
+# Shopify CLI 4.x requires BOTH of the sections below, even though they overlap.
+# `[webhooks]` is where the compliance addresses live; `[events]` is the newer
+# module that replaced it and is validated separately. Leaving either one out
+# fails with a bare "Required" and no hint as to which schema is meant.
+[webhooks]
+api_version = "2026-07"
+
+  # The three topics every public app must answer, whether or not it holds any
+  # customer data. This one does not — it stores a shop domain, a token, and
+  # per-SKU stock changes — and the handlers say exactly that.
+  #
+  # inventory_levels/update and app/uninstalled are deliberately NOT declared
+  # here: the service subscribes to them itself through webhookSubscriptionCreate
+  # once an install completes. See internal/shopify/webhook.go.
+  [webhooks.privacy_compliance]
+  customer_data_request_url = "/webhooks/customers_data_request"
+  customer_deletion_url     = "/webhooks/customers_redact"
+  shop_deletion_url         = "/webhooks/shop_redact"
+
+# Declared, but with no static subscriptions. CLI 4.x requires the section and
+# the key to be present; an empty list satisfies both.
+#
+# The two topics this app listens to — inventory_levels/update and
+# app/uninstalled — are subscribed at runtime instead, through
+# webhookSubscriptionCreate, once an install completes. That way a store gets
+# its subscriptions the moment it installs, with no config release standing in
+# between. See internal/shopify/webhook.go.
+[events]
+# "unstable", not the dated version above, and the CLI rejects anything else.
+# The events module is still a preview feature; the version that matters for the
+# Admin API calls this service makes is the one in [webhooks] and in
+# SHOPIFY_API_VERSION.
+api_version = "unstable"
+subscription = []
+
+[build]
+# dev_store_url is deliberately absent: the CLI then asks which store to use and
+# remembers the answer. Pinning a guessed domain here only produces "could not
+# find store", which says nothing about what the right domain would be.
+
+# Let the CLI rewrite application_url and redirect_urls to match the tunnel it
+# just started. Without this, every `shopify app dev` would hand out a new
+# address that Shopify has never heard of, and the callback would be refused.
+automatically_update_urls_on_dev = true
+
+# Ship this file's settings with every deploy, so a released version and this
+# file cannot drift apart.
+include_config_on_deploy = true

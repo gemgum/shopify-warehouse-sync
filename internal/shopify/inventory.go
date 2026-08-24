@@ -2,6 +2,8 @@ package shopify
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"strings"
 
@@ -14,11 +16,13 @@ var _ models.StoreInventory = (*Client)(nil)
 
 // The query submitted as a bulk operation.
 //
-// Deliberately **free of nested connections**. A bulk operation splits every
-// nested connection into its own JSONL line, linked by `__parentId`, and
-// stitching those back together is easy-to-get-wrong code for a benefit that
-// does not exist here. `inventoryQuantity` is already the variant's available
-// total, and the location is fetched once by the separate query below.
+// The nested `inventoryLevels` connection is the point of it. An earlier
+// version asked only for `inventoryQuantity` and paired every variant with the
+// store's first active location — which is wrong twice over on a real store:
+// `inventoryQuantity` is the total across locations, and the first location is
+// very often not one where the item is stocked at all. Shopify answers such a
+// write with "The specified inventory item is not stocked at the location" and
+// refuses the whole batch.
 const bulkVariantQuery = `
 {
   productVariants {
@@ -26,98 +30,169 @@ const bulkVariantQuery = `
       node {
         id
         sku
-        inventoryQuantity
-        inventoryItem { id }
+        inventoryItem {
+          id
+          tracked
+          inventoryLevels {
+            edges {
+              node {
+                location { id }
+                quantities(names: ["available"]) { quantity }
+              }
+            }
+          }
+        }
       }
     }
   }
 }`
 
-const primaryLocationQuery = `
-query {
-  locations(first: 1, includeInactive: false, includeLegacy: false) {
-    nodes { id }
-  }
-}`
-
-type variantLine struct {
-	SKU               string `json:"sku"`
-	InventoryQuantity int    `json:"inventoryQuantity"`
-	InventoryItem     struct {
-		ID string `json:"id"`
+// bulkLine is one line of the result file — either a variant or one of its
+// inventory levels. Which one it is, is told by the fields that are present.
+type bulkLine struct {
+	ID            string `json:"id"`
+	SKU           string `json:"sku"`
+	InventoryItem *struct {
+		ID      string `json:"id"`
+		Tracked bool   `json:"tracked"`
 	} `json:"inventoryItem"`
+
+	Location *struct {
+		ID string `json:"id"`
+	} `json:"location"`
+	Quantities []struct {
+		Quantity int `json:"quantity"`
+	} `json:"quantities"`
+
+	// Present on the child lines only, and it holds the **variant's** id — the
+	// inventory item is inlined into the variant line rather than emitted as a
+	// line of its own, so it is not what the children point at.
+	ParentID string `json:"__parentId"`
 }
 
 // List reads a store's entire stock through the Bulk Operations API.
 func (c *Client) List(ctx context.Context, shop models.Shop) ([]models.InventoryItem, error) {
-	location, err := c.primaryLocation(ctx, shop)
-	if err != nil {
-		return nil, err
-	}
-
 	url, err := c.runBulkQuery(ctx, shop, bulkVariantQuery)
 	if err != nil {
 		return nil, err
 	}
 
-	var items []models.InventoryItem
-	err = c.eachBulkLine(ctx, url, func(line []byte) error {
-		variant, err := decodeLine[variantLine](line)
+	var collected variants
+
+	err = c.eachBulkLine(ctx, url, func(raw []byte) error {
+		line, err := decodeLine[bulkLine](raw)
 		if err != nil {
 			return httpx.UpstreamError(fmt.Errorf("a bulk result line could not be read: %w", err))
 		}
-		items = append(items, models.InventoryItem{
-			SKU:             variant.SKU,
-			InventoryItemID: variant.InventoryItem.ID,
-			LocationID:      location,
-			Quantity:        variant.InventoryQuantity,
-		})
+		collected.add(line)
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
+
+	items := collected.done()
+	c.logger.Debug("stock read", "shop", shop.Domain, "variants", len(items))
+
 	return items, nil
 }
 
-// primaryLocation fetches the location stock is written to.
+// variants turns the flat JSONL back into one item per variant.
 //
-// ponytail: one location. A store with several warehouses needs a location map
-// coming from its own warehouse feed, and that is a change to the feed's shape
-// — not to the code here. Fetched every sync rather than stored: a merchant can
-// change locations at any time, and caching it means writing stock into a
-// warehouse that is no longer in use, with nothing to signal it.
-func (c *Client) primaryLocation(ctx context.Context, shop models.Shop) (string, error) {
-	var out struct {
-		Locations struct {
-			Nodes []struct {
-				ID string `json:"id"`
-			} `json:"nodes"`
-		} `json:"locations"`
-	}
-	if err := c.graphql(ctx, shop, primaryLocationQuery, nil, &out); err != nil {
-		return "", err
-	}
-	if len(out.Locations.Nodes) == 0 {
-		return "", httpx.UpstreamError(fmt.Errorf("store %s has no active location", shop.Domain))
-	}
-	return out.Locations.Nodes[0].ID, nil
+// Shopify emits a variant, then that variant's inventory levels, then the next
+// variant — children always follow their parent — so the file can be folded up
+// as it streams, without holding all of it in memory.
+type variants struct {
+	items   []models.InventoryItem
+	current *models.InventoryItem
+	levels  int
+	tracked bool
 }
 
+// add folds one line into the item being built.
+func (v *variants) add(line bulkLine) {
+	if line.InventoryItem != nil {
+		// A variant line: the previous variant is finished.
+		v.flush()
+		v.current = &models.InventoryItem{
+			SKU:             line.SKU,
+			InventoryItemID: line.InventoryItem.ID,
+		}
+		v.levels, v.tracked = 0, line.InventoryItem.Tracked
+		return
+	}
+
+	if v.current == nil || line.Location == nil {
+		return
+	}
+	v.levels++
+
+	// The **first** stocked location wins, and a second one disqualifies the
+	// variant entirely — see flush.
+	if v.levels == 1 {
+		v.current.LocationID = line.Location.ID
+		if len(line.Quantities) > 0 {
+			v.current.Quantity = line.Quantities[0].Quantity
+		}
+	}
+}
+
+// flush closes off the variant being built.
+//
+// **A variant is only syncable when its location is unambiguous.** Stock that
+// lives at two locations cannot be set from a feed that gives one number per
+// SKU — splitting it would be a guess, and guessing wrong quietly moves real
+// inventory. An untracked variant cannot be set at all; Shopify refuses the
+// mutation and takes the rest of the batch down with it.
+//
+// Both cases are kept in the list with no LocationID, so they still count as
+// examined, and Diff leaves them alone on the rule it already had.
+func (v *variants) flush() {
+	if v.current == nil {
+		return
+	}
+	if !v.tracked || v.levels != 1 {
+		v.current.LocationID = ""
+		v.current.Quantity = 0
+	}
+	v.items = append(v.items, *v.current)
+	v.current = nil
+}
+
+func (v *variants) done() []models.InventoryItem {
+	v.flush()
+	return v.items
+}
+
+// @idempotent is required on this mutation from API 2026-07 onward, and the
+// call is refused without it.
+//
+// The key is what lets Shopify recognise a repeat. It is minted once per batch
+// and travels as a variable, so the retry loop in graphql() — which re-sends
+// the identical payload after a 429 — carries the same key and cannot apply the
+// same stock change twice. A key generated per attempt would defeat the whole
+// mechanism while looking perfectly correct.
 const setQuantitiesMutation = `
-mutation Set($input: InventorySetQuantitiesInput!) {
-  inventorySetQuantities(input: $input) {
+mutation Set($input: InventorySetQuantitiesInput!, $key: String!) {
+  inventorySetQuantities(input: $input) @idempotent(key: $key) {
     userErrors { field message }
   }
 }`
 
 // Apply writes the decided quantities back to Shopify.
 //
-// `ignoreCompareQuantity: true` is deliberate: the warehouse is the source of
-// truth in this system, so whatever Shopify has recorded at the moment the
-// mutation lands must not veto the write. If Shopify ever becomes a source of
-// truth too, this is the first thing that has to change — along with every rule
-// in internal/services.
+// `changeFromQuantity` carries the quantity this sync read, and Shopify insists
+// on it — the mutation is refused outright without it, whatever introspection
+// says about the field being nullable.
+//
+// It makes every write an optimistic check: if the stock moved between the bulk
+// read and this mutation, Shopify refuses rather than overwriting a number it
+// can see is newer than ours. That is the right behaviour for a stock writer,
+// and the loss is nothing — the next sync recomputes Diff from the current
+// state and puts through whatever is still owed.
+//
+// (Before 2026-07 the same call could opt out of the comparison entirely with
+// `ignoreCompareQuantity: true`. That field is gone, and so is the option.)
 func (c *Client) Apply(ctx context.Context, shop models.Shop, updates []models.Update) error {
 	// Shopify's per-mutation limit. Sent in chunks, sequentially: concurrent
 	// mutations drain the budget bucket faster than it refills, so all that is
@@ -130,9 +205,10 @@ func (c *Client) Apply(ctx context.Context, shop models.Shop, updates []models.U
 		quantities := make([]map[string]any, 0, len(batch))
 		for _, u := range batch {
 			quantities = append(quantities, map[string]any{
-				"inventoryItemId": u.InventoryItemID,
-				"locationId":      u.LocationID,
-				"quantity":        u.NewQuantity,
+				"inventoryItemId":    u.InventoryItemID,
+				"locationId":         u.LocationID,
+				"quantity":           u.NewQuantity,
+				"changeFromQuantity": u.Quantity,
 			})
 		}
 
@@ -145,12 +221,14 @@ func (c *Client) Apply(ctx context.Context, shop models.Shop, updates []models.U
 			} `json:"inventorySetQuantities"`
 		}
 
-		vars := map[string]any{"input": map[string]any{
-			"name":                  "available",
-			"reason":                "correction",
-			"ignoreCompareQuantity": true,
-			"quantities":            quantities,
-		}}
+		vars := map[string]any{
+			"key": idempotencyKey(),
+			"input": map[string]any{
+				"name":       "available",
+				"reason":     "correction",
+				"quantities": quantities,
+			},
+		}
 
 		if err := c.graphql(ctx, shop, setQuantitiesMutation, vars, &out); err != nil {
 			return err
@@ -161,4 +239,16 @@ func (c *Client) Apply(ctx context.Context, shop models.Shop, updates []models.U
 		}
 	}
 	return nil
+}
+
+// idempotencyKey mints the key for one batch.
+//
+// crypto/rand rather than a counter or a timestamp: two syncs running close
+// together must not produce the same key, or Shopify would treat the second
+// one's genuinely different stock change as a repeat of the first and silently
+// drop it.
+func idempotencyKey() string {
+	b := make([]byte, 16)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
 }

@@ -63,15 +63,24 @@ func Load() (Config, error) {
 	loadEnvFile(EnvFile)
 
 	cfg := Config{
-		DatabaseURL:     os.Getenv("DATABASE_URL"),
-		APIKey:          os.Getenv("SHOPIFY_API_KEY"),
-		APISecret:       os.Getenv("SHOPIFY_API_SECRET"),
-		AppURL:          strings.TrimSuffix(os.Getenv("APP_URL"), "/"),
-		SyncToken:       os.Getenv("SYNC_TOKEN"),
-		Scopes:          valueOr("SHOPIFY_SCOPES", "read_products,read_inventory,write_inventory"),
-		APIVersion:      valueOr("SHOPIFY_API_VERSION", "2025-01"),
+		DatabaseURL: os.Getenv("DATABASE_URL"),
+		APIKey:      os.Getenv("SHOPIFY_API_KEY"),
+		APISecret:   os.Getenv("SHOPIFY_API_SECRET"),
+		SyncToken:   os.Getenv("SYNC_TOKEN"),
+
+		// HOST, PORT, and SCOPES are what the Shopify CLI passes in when the
+		// service is started by `shopify app dev`. They win over their .env
+		// counterparts, and deliberately so: the CLI opens a fresh tunnel on
+		// every run, so an APP_URL left over in .env from yesterday points at
+		// an address that no longer exists — and the install then fails with
+		// nothing useful to say.
+		AppURL:  strings.TrimSuffix(firstOf(os.Getenv("HOST"), os.Getenv("APP_URL")), "/"),
+		Address: listenAddress(),
+		Scopes: firstOf(os.Getenv("SCOPES"), os.Getenv("SHOPIFY_SCOPES"),
+			"read_products,read_inventory,write_inventory"),
+
+		APIVersion:      valueOr("SHOPIFY_API_VERSION", "2026-07"),
 		WarehouseSource: valueOr("WAREHOUSE_SOURCE", "warehouse.json"),
-		Address:         valueOr("ADDRESS", ":8080"),
 		ReadTimeout:     seconds("READ_TIMEOUT_SECONDS", 15),
 		WriteTimeout:    seconds("WRITE_TIMEOUT_SECONDS", 30),
 	}
@@ -141,6 +150,28 @@ func seconds(key string, fallback int) time.Duration {
 		n = fallback
 	}
 	return time.Duration(n) * time.Second
+}
+
+// listenAddress works out the port to listen on.
+//
+// BACKEND_PORT is assigned by the Shopify CLI, which then tunnels to exactly
+// that port. Listening anywhere else means the tunnel reaches nothing, so it
+// wins over ADDRESS.
+func listenAddress() string {
+	if port := firstOf(os.Getenv("BACKEND_PORT"), os.Getenv("PORT")); port != "" {
+		return ":" + port
+	}
+	return valueOr("ADDRESS", ":8080")
+}
+
+// firstOf returns the first value that is not empty.
+func firstOf(values ...string) string {
+	for _, v := range values {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 func valueOr(key, fallback string) string {
